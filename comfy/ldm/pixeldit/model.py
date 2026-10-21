@@ -6,7 +6,7 @@ import comfy.ldm.common_dit
 import comfy.patcher_extension
 from comfy.ldm.flux.math import apply_rope, rope
 from comfy.ldm.hidream.model import FeedForwardSwiGLU
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import AttentionTensorContainer, ComfyAttention, optimized_attention
 from comfy.ldm.modules.diffusionmodules.mmdit import TimestepEmbedder
 
 from .modules import (
@@ -27,6 +27,7 @@ class MMDiTJointAttention(nn.Module):
     """
     def __init__(self, dim, num_heads=8, qkv_bias=False, dtype=None, device=None, operations=None):
         super().__init__()
+        self.comfy_attention = ComfyAttention()
         assert dim % num_heads == 0
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
@@ -66,10 +67,12 @@ class MMDiTJointAttention(nn.Module):
         k_joint = torch.cat([ky, kx], dim=2)
         v_joint = torch.cat([vy, vx], dim=2)
 
+        del qkv_x, qkv_y, qx, kx, vx, qy, ky, vy
+        q_joint, k_joint, v_joint = AttentionTensorContainer(q_joint), AttentionTensorContainer(k_joint), AttentionTensorContainer(v_joint)
         out_joint = optimized_attention(
             q_joint, k_joint, v_joint, H,
             mask=attn_mask, skip_reshape=True, skip_output_reshape=True,
-            transformer_options=transformer_options,
+            transformer_options=transformer_options, preferred_attention=self.comfy_attention,
         )
 
         out_y = out_joint[:, :, :Ny, :].transpose(1, 2).reshape(B, Ny, H * D)
@@ -197,6 +200,9 @@ class PixDiT_T2I(nn.Module):
         """Hook for subclasses to inject per-block state into the patch stream (e.g. PiD's LQ gate)."""
         return s
 
+    def _pre_pixel_blocks(self, s, **kwargs):
+        return s
+
     def _forward(self, x, timesteps, context=None, attention_mask=None, transformer_options={}, **kwargs):
         H_orig, W_orig = x.shape[2], x.shape[3]
         x = comfy.ldm.common_dit.pad_to_patch_size(x, (self.patch_size, self.patch_size))
@@ -226,6 +232,7 @@ class PixDiT_T2I(nn.Module):
             s, y_emb = blk(s, y_emb, condition, pos_img, pos_txt, None, transformer_options=transformer_options)
         s = F.silu(t_emb + s)
 
+        s = self._pre_pixel_blocks(s, **kwargs)
         s_cond = s.view(B * L, self.hidden_size)
         x_pixels = self.pixel_embedder(x, patch_size=self.patch_size)
         for blk in self.pixel_blocks:
